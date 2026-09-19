@@ -404,6 +404,10 @@ func _ready():
 	# ===== 修复70 收尾 =====
 	call_deferred("_v70_init")
 	# ===== 修复70 结束 =====
+
+	# ===== 修复73 收尾 =====
+	call_deferred("_v73_init")
+	# ===== 修复73 结束 =====
 func setup(client, manager, executor):
 	context_manager = manager
 	_tool_executor = executor
@@ -1450,16 +1454,9 @@ func _get_filtered_tools() -> Array:
 		})
 	return tools
 func _stop_ai():
-	# 设置取消标记 → 后续的响应/错误会被丢弃
-	_v69_retry_cancelled = true
-	_v69_retry_active = false
-	if _v69_retry_timer != null and is_instance_valid(_v69_retry_timer):
-		_v69_retry_timer.stop()
-	_is_stopped = false   # 立即复位，避免下一次正常响应的检查误伤
-	_is_retrying = false
-	_retry_count = 0
-	_last_send_payload = {}
-	_clear_tool_progress()
+	_v73_user_cancelled = true
+	_v73_force_reset_all()
+	_v73_user_cancelled = true
 	batch_queue.clear()
 	batch_results.clear()
 	current_tool_context = {}
@@ -1472,9 +1469,8 @@ func _stop_ai():
 			_tool_executor.cancel_pending_action()
 	_current_bubble = null
 	_current_role = ""
-	# 强制发送按钮恢复
-	_update_ui_state(false)
 	_show_toast("[color=orange]已手动取消[/color]")
+	_v73_deferred_clear_cancel()
 func _on_input_gui_input(event: InputEvent):
 	if event is InputEventKey and event.pressed:
 		if event.keycode == KEY_ENTER and event.shift_pressed:
@@ -2142,18 +2138,13 @@ func _get_error_logs() -> String:
 	return "\n\n".join(filtered_errors)
 
 func _on_ai_response(response: String):
-	# 用户在等待响应时终止 → 丢弃这条响应
-	if _v69_retry_cancelled:
-		_v69_cleanup_and_restore()
+	# 用户已取消 → 丢弃响应
+	if _v73_user_cancelled:
+		_v73_user_cancelled = false
+		_v73_force_reset_all()
 		return
-	
-	# 收到正常响应 → 停止重试
-	_v69_stop_retry()
-	_retry_count = 0
-	_is_retrying = false
-	_last_send_payload = {}
-	_update_ui_state(false)
-	
+	# 收到响应 → 强制清所有重试状态
+	_v73_force_reset_all()
 	if _is_stopped:
 		return
 	_try_display_reasoning()
@@ -2168,6 +2159,9 @@ func _on_ai_response(response: String):
 	_current_role = ""
 	if _plan_pending:
 		execute_plan_btn.visible = true
+	# 自动保存（AI 回复完毕）
+	if has_method("_v73_autosave"):
+		_v73_autosave()
 func _extract_text_tool_calls(text: String) -> Array:
 	var calls = []
 	
@@ -2217,28 +2211,31 @@ func _strip_tool_call_text(text: String) -> String:
 	return result
 
 func _on_ai_error(error: String):
-	# 用户终止
-	if _v69_retry_cancelled or _is_stopped:
-		_v69_cleanup_and_restore()
-		_is_stopped = false
+	if _v73_user_cancelled:
+		_v73_user_cancelled = false
+		_v73_force_reset_all()
 		return
-	
+	if _is_stopped:
+		_v73_force_reset_all()
+		return
 	# ─── 无限重试 ───
 	if _infinite_retry:
 		if _v69_retry_active:
-			# 已在重试中 → 忽略重复 error，不改按钮
 			return
 		if _last_send_payload.is_empty():
-			_v69_cleanup_and_restore()
+			_v73_force_reset_all()
 			return
 		_v69_retry_count += 1
 		var wait_s: float = 5.0 if _v69_retry_count <= 3 else 7.5
 		_set_tool_progress("💭 接收响应中…（第 " + str(_v69_retry_count) + " 次，等待 " + str(int(wait_s)) + "s）")
-		# 保持终止状态
+		_v69_ensure_timer()
+		_v69_retry_active = true
+		_v69_retry_cancelled = false
+		_v69_retry_timer.stop()
+		_v69_retry_timer.wait_time = wait_s
+		_v69_retry_timer.start()
 		_update_ui_state(true)
-		_v69_start_retry_wait(wait_s)
 		return
-	
 	# ─── 普通 5 次重试 ───
 	if _retry_count < _MAX_RETRIES and not _last_send_payload.is_empty():
 		_retry_count += 1
@@ -2248,9 +2245,8 @@ func _on_ai_error(error: String):
 		_set_tool_progress("⏳ " + str(int(delay)) + " 秒后重试 (" + str(_retry_count) + "/" + str(_MAX_RETRIES) + ")")
 		_update_ui_state(true)
 		await get_tree().create_timer(delay).timeout
-		if _is_stopped:
-			_v69_stop_retry()
-			_is_stopped = false
+		if _v73_user_cancelled or _is_stopped:
+			_v73_force_reset_all()
 			return
 		if gemini_client and not _last_send_payload.is_empty():
 			_update_ui_state(true)
@@ -2258,10 +2254,10 @@ func _on_ai_error(error: String):
 			gemini_client.send_prompt(_last_send_payload["final_prompt"], _last_send_payload["context"], tools, [])
 			_set_tool_progress("💭 接收响应中…（第 " + str(_retry_count) + " 次重试）")
 		else:
-			_v69_stop_retry()
+			_v73_force_reset_all()
 	else:
 		_show_toast("[color=red]Error: " + error + "[/color]")
-		_v69_stop_retry()
+		_v73_force_reset_all()
 func _log_user_message(msg: String, token_count: int = -1, insert_index: int = -1):
 	_add_to_chat(msg + "
 ", "user", insert_index)
@@ -4354,6 +4350,8 @@ func _on_edit_message_pressed(bubble, label):
 	save_btn.pressed.connect(func():
 		_v51_apply_blocks(blocks_vb, label)
 		_show_toast("[color=green]消息已保存[/color]")
+		if has_method("_v73_autosave"):
+			_v73_autosave()
 		panel.queue_free()
 	)
 	if resend_btn != null:
@@ -4681,6 +4679,8 @@ func _on_delete_message_pressed(bubble):
 				_current_role = ""
 		bubble.queue_free()
 		_show_toast("[color=orange]消息已删除[/color]")
+		if has_method("_v73_autosave"):
+			_v73_autosave()
 	)
 	cancel_btn.pressed.connect(func(): panel.queue_free())
 
@@ -8725,6 +8725,8 @@ func _v57_on_summary_response(_result, code, _headers, body):
 		return
 	_v61_render_summary(text.strip_edges())
 	_show_toast("[color=green]对话总结已生成[/color]")
+	if has_method("_v73_autosave"):
+		_v73_autosave()
 
 
 func _on_token_usage(usage: Dictionary):
@@ -8971,6 +8973,8 @@ func _v57_show_summary_dialog(divider):
 		if is_instance_valid(lbl):
 			lbl.text = new_text
 		_show_toast("[color=green]总结已保存[/color]")
+		if has_method("_v73_autosave"):
+			_v73_autosave()
 		panel.queue_free()
 	)
 	cancel_btn.pressed.connect(func(): panel.queue_free())
@@ -8978,6 +8982,8 @@ func _v57_show_summary_dialog(divider):
 		if is_instance_valid(divider):
 			divider.queue_free()
 		_show_toast("[color=orange]对话总结已删除[/color]")
+		if has_method("_v73_autosave"):
+			_v73_autosave()
 		panel.queue_free()
 	)
 
@@ -9929,34 +9935,31 @@ func _v69_start_retry_wait(wait_s: float):
 
 # 计时器到时：所有状态检查通过才发请求；否则清理
 func _v69_on_retry_timeout():
-	if _v69_retry_cancelled:
-		_v69_cleanup_and_restore()
+	if _v73_user_cancelled:
+		_v73_force_reset_all()
+		_v73_user_cancelled = true
 		return
 	if _is_stopped:
-		_v69_cleanup_and_restore()
+		_v73_force_reset_all()
 		return
 	if not _infinite_retry:
-		_v69_cleanup_and_restore()
+		_v73_force_reset_all()
 		return
 	if not _v69_retry_active:
-		_v69_cleanup_and_restore()
+		_v73_force_reset_all()
 		return
 	if _last_send_payload.is_empty():
-		_v69_cleanup_and_restore()
+		_v73_force_reset_all()
 		return
 	if gemini_client == null:
-		_v69_cleanup_and_restore()
+		_v73_force_reset_all()
 		return
-	# 输入框已恢复可编辑 → 用户已终止
 	if input_field != null and input_field.editable == true:
-		_v69_cleanup_and_restore()
+		_v73_force_reset_all()
 		return
-	# 发出请求；保持"终止"状态（不调 _update_ui_state，避免闪烁）
 	var tools = _get_filtered_tools()
 	gemini_client.send_prompt(_last_send_payload["final_prompt"], _last_send_payload["context"], tools, [])
 	_set_tool_progress("💭 接收响应中…（第 " + str(_v69_retry_count) + " 次已发出）")
-
-
 func _v69_cleanup_and_restore():
 	if _v69_retry_timer != null and is_instance_valid(_v69_retry_timer):
 		_v69_retry_timer.stop()
@@ -10024,3 +10027,56 @@ func _v69_force_summary_into_history():
 	pass
 func _v70_init():
 	_v69_ensure_timer()
+
+
+
+# ═══════════════════════════════════════════════════════════════
+# 修复73：强制重置 + 用户取消 + 自动保存
+# ═══════════════════════════════════════════════════════════════
+
+var _v73_user_cancelled: bool = false
+var _v73_autosave_pending: bool = false
+
+
+func _v73_force_reset_all():
+	_v69_retry_active = false
+	_v69_retry_cancelled = false
+	_v69_retry_count = 0
+	_is_retrying = false
+	_retry_count = 0
+	_is_stopped = false
+	_last_send_payload = {}
+	if _v69_retry_timer != null and is_instance_valid(_v69_retry_timer):
+		_v69_retry_timer.stop()
+	_clear_tool_progress()
+	_update_ui_state(false)
+
+
+func _v73_autosave():
+	if _v73_autosave_pending:
+		return
+	_v73_autosave_pending = true
+	call_deferred("_v73_do_autosave")
+
+
+func _v73_do_autosave():
+	_v73_autosave_pending = false
+	# 若正在编辑对话框 → 等对话框关闭后再保存
+	var edit_panel = get_node_or_null("__EditPanel")
+	if edit_panel != null and is_instance_valid(edit_panel):
+		await get_tree().create_timer(0.5).timeout
+		_v73_autosave()
+		return
+	if has_method("_save_all_messages_to_file"):
+		_save_all_messages_to_file()
+
+
+func _v73_deferred_clear_cancel():
+	await get_tree().create_timer(2.0).timeout
+	# 如果 2 秒后仍然不在重试 → 清标记（正常发消息后就不用保留）
+	if not _v69_retry_active:
+		_v73_user_cancelled = false
+
+
+func _v73_init():
+	_v73_user_cancelled = false
