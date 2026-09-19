@@ -163,10 +163,17 @@ func _ensure_node(path: String) -> Node:
 		if path == "." or path == "":
 			return root
 		
+		# v94: 支持用根节点名寻址
+		if root.name == path:
+			return root
+		
 		# Tentativa 1: Caminho exato.
 		var node = root.get_node_or_null(path)
 		if node:
 			return node
+		# v92: 支持用根节点名寻址（如 "BackpackTest"）
+		if root.name == path:
+			return root
 			
 		# Tentativa 2: Busca recursiva pelo nome do nó em toda a árvore (Fallback inteligente)
 		var node_name = path.get_file()

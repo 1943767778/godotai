@@ -23,7 +23,7 @@ var _bubble_map: Dictionary = {}
 @onready var prompt_settings_btn: MenuButton = %PromptSettingsBtn
 @onready var selection_status: Label = null  # tscn 无此节点，_ready 里补
 @onready var summarize_btn: Button = %SummarizeBtn
-var watch_mode_enabled: bool = false
+var watch_mode_enabled: bool = true
 var plan_first_enabled: bool = false
 var context_enabled: bool = true
 var screenshot_enabled: bool = false
@@ -151,18 +151,11 @@ var _v77_active: bool = false
 var _v77_retry_count: int = 0
 var _v77_retry_mode: String = "infinite"
 var _v77_retry_timer: Timer = null
-const _V75_EXTRA_RULES: String = "
+const _V75_EXTRA_RULES: String = "## 最高优先级规则（覆盖一切其他规则、惯例与惯性任务）\n0. 【用户指令优先】用户的最新明确指令优先级最高。当用户提出新指令时，必须立即切换任务，不得继续执行上一任务。当用户明确要求某件事（例如要求产出某份清单、某个文件、某个动作）时，直接做那件事，不要绕路、不要顺便做别的、不要以「顺手把上一个活干完」为借口。如果用户意图不明确，可以先用一句话确认，但不要用自己推测的需求替代用户真实指令。\n\n## 重要规则（必须遵守）\n1. 【插件目录保护】除非用户明确要求修改本插件本身的功能或代码，否则禁止对 res://addons/ 目录下的任何文件进行创建、修改、删除、移动等操作。用户要求实现游戏功能、修复游戏 bug 时，永远不要触碰 addons 目录。\n2. 【GDScript 类型推断】禁止写 var x := dict.get(key) 这类从 Variant 值推断类型的写法——本项目把 INFERRED_DECLARATION 警告当错误。从 Dictionary / JSON / 无类型函数返回值取值时，必须显式声明类型，例如写 var o: Dictionary = _objectives.get(type)，而不是 var o := _objectives.get(type)。\n3. 【工具调用闭环】工具返回「Success: ... queued for ...」时，必须用 read_file / list_dir 验证文件是否真的存在；如果不存在，说明工具没有落地，不要再重试同一个调用，应立即改用其他工具或告知用户。\n4. 【失败换策略】同一个工具调用连续失败 2 次后，必须换策略或向用户报告，不允许第 3 次原样重试。\n5. 【假设显式化】需要做关键设计决策时，如果用户没有明确说明，可以推进，但必须显式标注「我假设了 XX，如果不对请纠正」，不要默认正确。\n6. 【上下文不可信时以现实验证为准】如果历史摘要与当前项目状态矛盾（例如摘要说项目为空但 list_dir 看到很多文件），以 list_dir / read_file 的实际结果为准，不要被旧摘要带偏。"
 
-## 重要规则（必须遵守）
-1. 【插件目录保护】除非用户明确要求修改本插件本身的功能或代码，否则禁止对 res://addons/ 目录下的任何文件进行创建、修改、删除、移动等操作。用户要求实现游戏功能、修复游戏 bug 时，永远不要触碰 addons 目录。
-2. 【GDScript 类型推断】禁止写 `var x := dict.get(key)` 这类从 Variant 值推断类型的写法——本项目把 INFERRED_DECLARATION 警告当错误。从 Dictionary / JSON / 无类型函数返回值取值时，必须显式声明类型，例如写 `var o: Dictionary = _objectives.get(type)`，而不是 `var o := _objectives.get(type)`。
-"
+const _V99_EXTRA_RULES: String = "\n\n## 工具挂载声明（必须遵守）\n7. 【你有工具，必须调用】你（AI）挂载了文件编辑、场景编辑、备份、查询等工具，必须通过工具调用真实操作文件，不能只输出文字说明或代码片段让用户手动粘贴，也不要声称「我没有工具」——工具始终挂载着。\n调用工具时：优先使用系统 function calling 协议；如果只能输出文本，请用 <tool_call>...</tool_call> 包裹，内部是一个 JSON 对象，字段 name 表示工具名，字段 arguments 表示参数对象。\n8. 【一次多调】如果一次需要多个工具，请发出多个 tool_calls 条目，或者写多个连续的 <tool_call>...</tool_call> 块，块与块之间不要穿插自然语言。\n9. 【路径原样输出】文件路径必须原样输出，不要用 markdown 链接语法（例如不要写成 [foo.gd](https://foo.gd/)），也不要加任何修饰。\n"
 
-const _V86_QUEUE_HINT: String = "
-
-## 编辑器加载中
-如果调用文件编辑工具时反复出现「正在排队中」或长时间无响应，说明 Godot 编辑器可能没有完全加载好（例如从后台切回、编辑器仍在转圈）。此时不要反复重试，应当提示用户检查编辑器状态（是否仍在加载、是否有弹窗阻塞），建议用户重新打开 Godot 项目，并保持 Godot 软件在前台。
-"
+const _V86_QUEUE_HINT: String = "## 编辑器加载中\n如果调用文件编辑工具时反复出现「正在排队中」或长时间无响应，说明 Godot 编辑器可能没有完全加载好（例如从后台切回、编辑器仍在转圈）。此时不要反复重试，应当提示用户检查编辑器状态（是否仍在加载、是否有弹窗阻塞），建议用户重新打开 Godot 项目，并保持 Godot 软件在前台。"
 
 var _v86_queue_hint_pending: bool = false
 var _v89_tool_start_time: float = 0.0
@@ -191,6 +184,10 @@ func _ready():
 	# Connect scene node signals
 	prompt_settings_btn.get_popup().id_pressed.connect(_on_prompt_setting_id_pressed)
 	
+	var _v95_tc = $TabContainer
+	if _v95_tc != null and _v95_tc is TabContainer:
+		if not _v95_tc.tab_changed.is_connected(_v95_on_tab_changed):
+			_v95_tc.tab_changed.connect(_v95_on_tab_changed)
 	%ExecutePlanBtn.pressed.connect(_on_execute_plan_pressed)
 	
 	send_button.pressed.connect(_on_send_pressed)
@@ -449,6 +446,7 @@ func _ready():
 
 	# ===== 修复83v2 收尾 =====
 	call_deferred("_v83_init")
+	call_deferred("_v95_run_after_layout")
 	call_deferred("_v84_force_min_width")
 	# ===== 修复83v2 结束 =====
 func setup(client, manager, executor):
@@ -813,6 +811,10 @@ func _load_presets():
 	
 	var idx := 0
 	for i in range(preset_selector.item_count):
+		var _v97_m = preset_selector.get_item_metadata(i)
+		if _v97_m != null and str(_v97_m) == active_preset_name:
+			idx = i
+			break
 		if preset_selector.get_item_text(i) == active_preset_name:
 			idx = i
 			break
@@ -824,7 +826,9 @@ func _update_preset_selector():
 	chat_preset_selector.clear()
 	for p_name in presets.keys():
 		preset_selector.add_item(p_name)
+		preset_selector.set_item_metadata(preset_selector.item_count - 1, p_name)
 		chat_preset_selector.add_item(p_name)
+		chat_preset_selector.set_item_metadata(chat_preset_selector.item_count - 1, p_name)
 	call_deferred("_shrink_all_options_v7")
 func _save_presets():
 	var settings = EditorInterface.get_editor_settings()
@@ -841,7 +845,15 @@ func _save_presets():
 func _on_preset_selected(index: int):
 	if index < 0 or index >= preset_selector.item_count:
 		return
-	active_preset_name = preset_selector.get_item_text(index)
+	# v97: 从 metadata 读原名（item 文本可能被 shorten 逻辑截断）
+	var _v97_meta = preset_selector.get_item_metadata(index)
+	var _v97_name: String = str(_v97_meta) if _v97_meta != null else ""
+	if _v97_name == "" or not presets.has(_v97_name):
+		var _v97_keys = presets.keys()
+		if index >= _v97_keys.size():
+			return
+		_v97_name = str(_v97_keys[index])
+	active_preset_name = _v97_name
 	if not presets.has(active_preset_name):
 		return
 	var config = presets[active_preset_name]
@@ -873,6 +885,11 @@ func _on_add_preset_pressed():
 	}
 	_update_preset_selector()
 	for i in range(preset_selector.item_count):
+		var _v97_m3 = preset_selector.get_item_metadata(i)
+		if _v97_m3 != null and str(_v97_m3) == new_name:
+			preset_selector.selected = i
+			_on_preset_selected(i)
+			break
 		if preset_selector.get_item_text(i) == new_name:
 			preset_selector.selected = i
 			_on_preset_selected(i)
@@ -935,7 +952,7 @@ func _update_fields_for_provider(index: int):
 		if locale_manager:
 			api_input.placeholder_text = locale_manager.tr("api_key_not_required")
 	else:
-		api_input.placeholder_text = ""
+		api_input.placeholder_text = "在此粘贴 API Key"
 	
 	if is_local and url_input.text == "":
 		url_input.text = "http://localhost:11434/v1"
@@ -985,6 +1002,11 @@ func _on_rename_preset(new_name: String):
 	
 	_update_preset_selector()
 	for i in range(preset_selector.item_count):
+		var _v97_m2 = preset_selector.get_item_metadata(i)
+		if _v97_m2 != null and str(_v97_m2) == active_preset_name:
+			preset_selector.selected = i
+			chat_preset_selector.selected = i
+			break
 		if preset_selector.get_item_text(i) == active_preset_name:
 			preset_selector.selected = i
 			chat_preset_selector.selected = i
@@ -1468,7 +1490,10 @@ func _on_prompt_setting_id_pressed(id: int):
 			if gemini_client:
 				gemini_client.screenshot_enabled = checked
 		2: plan_first_enabled = checked
-		3: watch_mode_enabled = checked
+		3:
+			watch_mode_enabled = checked
+			var _v93_s = EditorInterface.get_editor_settings()
+			_v93_s.set_setting("gamedev_ai/watch_mode_enabled", checked)
 func _get_filtered_tools() -> Array:
 	var tools: Array = []
 	if _tool_executor:
@@ -1959,11 +1984,14 @@ CRITICAL INSTRUCTION: The user has enabled 'Plan First' mode. Do NOT output any 
 		_v77_retry_count = 0
 		# ─── 注入 addons / 编辑器规则 ───
 		var _v75_orig: String = str(gemini_client.custom_instructions)
-		var _v86_extra: String = _V75_EXTRA_RULES
+		var _v86_extra: String = _V75_EXTRA_RULES + _V99_EXTRA_RULES
 		if _v86_queue_hint_pending:
 			_v86_extra += _V86_QUEUE_HINT
 			_v86_queue_hint_pending = false
 		gemini_client.custom_instructions = _v75_orig + _v86_extra
+		# v100: 规则也拼进 user prompt，防止代理吞 systemInstruction
+		if _v86_extra.strip_edges() != "":
+			final_prompt = _v86_extra + "\n\n" + final_prompt
 		gemini_client.send_prompt(final_prompt, context, tools, files_data)
 		gemini_client.custom_instructions = _v75_orig
 		_set_tool_progress("📨 消息已发出，正在接收消息…")
@@ -2019,10 +2047,7 @@ func _on_tool_calls(tool_calls: Array):
 		_show_toast("[color=orange]已忽略 " + str(_v87_dropped) + " 项损坏的工具调用[/color]")
 	
 	if not batch_queue.is_empty():
-		var first_tool = batch_queue[0]
-		var action_name = "AI Batch: " + first_tool.get("name", "Unknown")
-		if _tool_executor.has_method("start_composite_action"):
-			_tool_executor.start_composite_action(action_name)
+		# v90: 弃用 composite（工具自己 create_action + commit_action，立即落盘）
 		_process_next_batch_item()
 func _process_next_batch_item():
 	if _is_stopped:
@@ -2082,22 +2107,31 @@ func _on_tool_output(output: String):
 		_clear_tool_progress()
 		return
 	
-	# 排队中检测
-	var low: String = output.to_lower()
-	if "排队" in output or "queued" in low or "waiting in queue" in low:
-		_v76_queued_count += 1
-		if _v76_queued_count >= 3:
-			_show_toast("[color=orange]工具多次排队中，编辑器可能仍在加载
-请检查 Godot 是否已完成启动，或尝试重新打开项目[/color]")
-			_v76_queued_count = 0
+	# v90: 排队检测改为基于时间（工具执行 >= 8s 才算真排队）
+	var _v90_elapsed: float = (Time.get_ticks_msec() / 1000.0) - _v89_tool_start_time
+	if _v89_tool_pending and _v90_elapsed >= 8.0:
+		if not _v86_queue_hint_pending:
+			_v86_queue_hint_pending = true
+			print("[AI-v90] 工具执行超时 " + str(int(_v90_elapsed)) + "s，下次请求附带编辑器提示")
+	_v89_tool_pending = false
+	_v76_queued_count = 0
 	
 	var line_count = output.count("
 ") + 1
 	var tool_name: String = ""
 	if not current_tool_context.is_empty():
 		tool_name = str(current_tool_context.get("name", ""))
-	var label: String = "📤 " + (tool_name if tool_name != "" else "结果") + " (" + str(line_count) + " 行)"
-	_append_collapsible_block(label, output, "green", false)
+	# v90: 工具结果含错误关键字 → 红色 + ❌
+	var _v90_low: String = output.to_lower()
+	var _v90_is_err: bool = false
+	for _v90_kw in ["error", "parse error", "compile error", "failed", "exception", "traceback", "报错", "失败"]:
+		if _v90_kw in _v90_low or _v90_kw in output:
+			_v90_is_err = true
+			break
+	var _v90_icon: String = "❌ " if _v90_is_err else "📤 "
+	var _v90_color: String = "red" if _v90_is_err else "green"
+	var label: String = _v90_icon + (tool_name if tool_name != "" else "结果") + " (" + str(line_count) + " 行)"
+	_append_collapsible_block(label, output, _v90_color, false)
 	
 	if not current_tool_context.is_empty():
 		var tool_id = current_tool_context.get("id", "")
@@ -2106,8 +2140,7 @@ func _on_tool_output(output: String):
 		current_tool_context = {}
 	
 	if not batch_queue.is_empty():
-		await get_tree().process_frame
-		_process_next_batch_item()
+		call_deferred("_process_next_batch_item")
 	else:
 		if gemini_client and not batch_results.is_empty():
 			var tools = _get_filtered_tools()
@@ -2126,8 +2159,6 @@ func _on_tool_output(output: String):
 			gemini_client.send_tool_responses(batch_results, tools, files_data)
 			batch_results.clear()
 			_set_tool_progress("📨 消息已发出，正在接收消息…")
-		if _tool_executor.has_method("commit_composite_action"):
-			_tool_executor.commit_composite_action()
 func _on_undo_pressed():
 	if _tool_executor and _tool_executor.has_method("undo"):
 		_tool_executor.undo()
@@ -2205,10 +2236,14 @@ func _on_ai_response(response: String):
 	if _is_stopped:
 		return
 	_try_display_reasoning()
-	if response.strip_edges() != "":
-		_add_to_chat(_markdown_to_bbcode(response) + "
-", "ai")
+	# v102: 先提取工具调用，剥离原文后再显示，避免双重显示
 	var extracted_calls = _extract_text_tool_calls(response)
+	var display_text: String = response
+	if not extracted_calls.is_empty():
+		display_text = _strip_tool_call_text(response)
+	if display_text.strip_edges() != "":
+		_add_to_chat(_markdown_to_bbcode(display_text) + "
+", "ai")
 	if not extracted_calls.is_empty():
 		_on_tool_calls(extracted_calls)
 		return
@@ -2220,6 +2255,8 @@ func _on_ai_response(response: String):
 		_v73_autosave()
 	if has_method("_v83_check_auto_summary"):
 		_v83_check_auto_summary()
+
+
 func _extract_text_tool_calls(text: String) -> Array:
 	var calls = []
 	
@@ -2257,16 +2294,23 @@ func _extract_text_tool_calls(text: String) -> Array:
 	return calls
 
 func _strip_tool_call_text(text: String) -> String:
-	var result = text
-	# Strip <tool_call>...</tool_call>
-	var regex1 = RegEx.new()
-	regex1.compile("<tool_call>[\\s\\S]*?</tool_call>")
-	result = regex1.sub(result, "", true)
-	# Strip ```json tool blocks
-	var regex2 = RegEx.new()
-	regex2.compile("```(?:json)?\\s*\\n\\s*\\{[\\s\\S]*?\"name\"[\\s\\S]*?\\}\\s*\\n\\s*```")
-	result = regex2.sub(result, "", true)
-	return result
+	var result: String = text
+	# 反复删除 <tool_call>...</tool_call>（字符串扫描，避免正则转义）
+	for _i in range(50):
+		var a: int = result.find("<tool_call>")
+		if a < 0:
+			break
+		var b: int = result.find("</tool_call>", a + 11)
+		if b < 0:
+			result = result.substr(0, a)
+			break
+		result = result.substr(0, a) + result.substr(b + 12)
+	# 删除孤立的开闭标签
+	result = result.replace("</tool_call>", "")
+	result = result.replace("<tool_call>", "")
+	result = result.replace("<|tool_call|>", "")
+	return result.strip_edges()
+
 
 func _on_ai_error(error: String):
 	pass
@@ -3872,6 +3916,28 @@ func _load_ui_settings():
 		_show_token_enabled = settings.get_setting("gamedev_ai/show_token")
 	if settings.has_setting("gamedev_ai/show_recv_time"):
 		_show_recv_time_enabled = settings.get_setting("gamedev_ai/show_recv_time")
+	# v94: 加载 watch mode（默认开启）
+	if settings.has_setting("gamedev_ai/watch_mode_enabled"):
+		watch_mode_enabled = settings.get_setting("gamedev_ai/watch_mode_enabled")
+	# v94: 同步 popup 勾选状态
+	if prompt_settings_btn != null:
+		var _v94_pp = prompt_settings_btn.get_popup()
+		if _v94_pp != null:
+			for _v94_i in range(_v94_pp.item_count):
+				if _v94_pp.get_item_id(_v94_i) == 3:
+					_v94_pp.set_item_checked(_v94_i, watch_mode_enabled)
+					break
+	# v93: 监视模式（默认开启，用户关过则用用户的选择）
+	if settings.has_setting("gamedev_ai/watch_mode_enabled"):
+		watch_mode_enabled = settings.get_setting("gamedev_ai/watch_mode_enabled")
+	# v93: 同步 popup 勾选状态
+	if prompt_settings_btn != null:
+		var _v93_pp = prompt_settings_btn.get_popup()
+		if _v93_pp != null:
+			for _v93_i in range(_v93_pp.item_count):
+				if _v93_pp.get_item_id(_v93_i) == 3:
+					_v93_pp.set_item_checked(_v93_i, watch_mode_enabled)
+					break
 
 
 # -------------------- 用量文件 --------------------
@@ -8753,7 +8819,7 @@ func _v57_generate_summary():
 		var lbl = c.get_meta("label", null)
 		if not is_instance_valid(lbl):
 			continue
-		var txt: String = lbl.get_parsed_text()
+		var txt: String = _v96_extract_from_ui_node(c)
 		if txt.strip_edges() == "":
 			continue
 		conversation += ("用户：" if role == "user" else "AI：") + txt + "\n\n"
@@ -8768,7 +8834,16 @@ func _v57_generate_summary():
 	var base_url = str(preset.get("base_url", ""))
 	var model = str(preset.get("model_name", ""))
 	
-	var summary_prompt = "你是一个对话总结助手。请将以下对话总结为简明摘要，保留关键信息：\n- 用户的主要目标\n- 已完成事项\n- 重要决策\n- 待办事项\n只输出摘要内容，不要任何前缀说明。\n\n=== 对话内容 ===\n" + conversation
+	var summary_prompt = "你是一个对话总结助手。请将以下对话总结为简明摘要，保留关键信息：
+- 用户的主要目标
+- 已完成事项
+- 重要决策
+- 待办事项
+摘要里不要抄写 [工具调用] / [工具结果] / <tool_call> 之类的技术标记或原始 JSON，用自然语言描述 AI 做过什么（例如：AI 修改了 enemy.gd 的接触伤害逻辑）。
+只输出摘要内容，不要任何前缀说明。
+
+=== 对话内容 ===
+" + conversation
 	
 	_v57_is_generating_summary = true
 	_show_toast("[color=cyan]正在生成对话总结…[/color]")
@@ -8920,7 +8995,7 @@ func _v58_generate_summary(target_bubble):
 		var lbl = c.get_meta("label", null)
 		if not is_instance_valid(lbl):
 			continue
-		var txt: String = lbl.get_parsed_text()
+		var txt: String = _v96_extract_from_ui_node(c)
 		if txt.strip_edges() == "":
 			continue
 		conversation += ("用户：" if role == "user" else "AI：") + txt + "\n\n"
@@ -9501,7 +9576,7 @@ func _v61_get_summary_text() -> String:
 	for c in chat_vbox.get_children():
 		if c.has_meta("is_summary") and bool(c.get_meta("is_summary")):
 			result = str(c.get_meta("summary_text", ""))
-	return result
+	return _v98_clean_summary(result)
 
 
 func _v61_has_summary() -> bool:
@@ -9539,7 +9614,7 @@ func _v61_apply_summary_history():
 		var lbl = c.get_meta("label", null)
 		if not is_instance_valid(lbl):
 			continue
-		var txt: String = lbl.get_parsed_text()
+		var txt: String = _v96_extract_from_ui_node(c)
 		if txt.strip_edges() == "":
 			continue
 		new_hist.append(_v61_build_hist_entry(role, txt, is_openai))
@@ -9596,7 +9671,7 @@ func _v61_generate_summary(target_bubble):
 		var lbl = c.get_meta("label", null)
 		if not is_instance_valid(lbl):
 			continue
-		var txt: String = lbl.get_parsed_text()
+		var txt: String = _v96_extract_from_ui_node(c)
 		if txt.strip_edges() == "":
 			continue
 		conversation += ("用户：" if role == "user" else "AI：") + txt + "
@@ -10396,7 +10471,7 @@ func _v83_rebuild_history_from_transcript():
 			var r = str(e.get("role", ""))
 			if r == "summary":
 				continue
-			var t = str(e.get("text", ""))
+			var t: String = _v96_extract_ai_text_from_entry(e)
 			if t.strip_edges() == "":
 				continue
 			new_hist.append(_v61_build_hist_entry(r, t, is_openai))
@@ -10407,7 +10482,7 @@ func _v83_rebuild_history_from_transcript():
 			var r = str(e.get("role", ""))
 			if r == "summary":
 				continue
-			var t = str(e.get("text", ""))
+			var t: String = _v96_extract_ai_text_from_entry(e)
 			if t.strip_edges() == "":
 				continue
 			new_hist.append(_v61_build_hist_entry(r, t, is_openai))
@@ -10421,4 +10496,173 @@ func _v83_rebuild_history_from_transcript():
 func _v83_init():
 	_v83_load_auto_summary_settings()
 	_v83_setup_autosummary_ui()
+
+func _v95_apply_btn_fixes():
+	# v95: 恢复被 layout pass 破坏文本的按钮
+	if api_input != null and str(api_input.placeholder_text).strip_edges() == "":
+		api_input.placeholder_text = "在此粘贴 API Key"
+
+	var stack: Array = [self]
+	while not stack.is_empty():
+		var n: Node = stack.pop_back()
+		if n is Button:
+			var tip: String = str(n.tooltip_text)
+			var bname: String = str(n.name)
+			var is_plus: bool = (bname == "__V61AddBtn") or ("新增" in tip and "密钥" in tip)
+			var is_minus: bool = ("删除此密钥" in tip)
+			if is_plus or is_minus:
+				n.text = "+" if is_plus else "-"
+				n.add_theme_color_override("font_color", Color(1, 1, 1))
+				n.add_theme_font_size_override("font_size", 16)
+				n.clip_text = false
+				n.text_overrun_behavior = TextServer.OVERRUN_NO_TRIMMING
+				if n.custom_minimum_size.x < 32:
+					n.custom_minimum_size = Vector2(32, 28)
+		for c in n.get_children():
+			stack.append(c)
+
+	if close_edit_btn != null and is_instance_valid(close_edit_btn):
+		close_edit_btn.text = "完成编辑"
+		close_edit_btn.clip_text = false
+		close_edit_btn.text_overrun_behavior = TextServer.OVERRUN_NO_TRIMMING
+		close_edit_btn.add_theme_color_override("font_color", Color(1, 1, 1))
+		if close_edit_btn.custom_minimum_size.x < 96:
+			close_edit_btn.custom_minimum_size = Vector2(96, 32)
+
+
+func _v95_run_after_layout():
+	await get_tree().process_frame
+	await get_tree().process_frame
+	await get_tree().process_frame
+	_v95_apply_btn_fixes()
+	await get_tree().process_frame
+	await get_tree().process_frame
+	_v95_apply_btn_fixes()
+
+
+func _v95_on_tab_changed(_tab_idx: int):
+	call_deferred("_v95_apply_btn_fixes")
+
+
+
+
+func _v96_extract_ai_text_from_entry(entry: Dictionary) -> String:
+	var blks = entry.get("blocks", [])
+	if blks is Array and not blks.is_empty():
+		var parts: Array = []
+		for b in blks:
+			if not (b is Dictionary):
+				continue
+			var label: String = str(b.get("label", ""))
+			var content: String = str(b.get("content", ""))
+			if content.strip_edges() == "" and label.strip_edges() == "":
+				continue
+			if "💭" in label or "思考" in label:
+				parts.append(content.strip_edges())
+			elif "🛠" in label or "工具调用" in label:
+				parts.append("<tool_call>" + content.strip_edges() + "</tool_call>")
+			elif "📤" in label or "结果" in label or "输出" in label:
+				parts.append("工具返回：" + content.strip_edges())
+			else:
+				if content.strip_edges() != "":
+					parts.append(content.strip_edges())
+		if not parts.is_empty():
+			return "\n\n".join(parts)
+	return str(entry.get("text", ""))
+
+
+func _v96_extract_from_ui_node(node: Node) -> String:
+	if not node.has_meta("role"):
+		return ""
+	var role: String = str(node.get_meta("role"))
+	if role == "user":
+		var lbl_u = node.get_meta("label", null)
+		if is_instance_valid(lbl_u):
+			return lbl_u.get_parsed_text().strip_edges()
+		return ""
+	var lbl = node.get_meta("label", null)
+	if not is_instance_valid(lbl):
+		return ""
+	var blocks: Array = []
+	var block_ids: Array = []
+	for bid in _block_data.keys():
+		if _block_data[bid].get("bubble_ref") == lbl:
+			block_ids.append(bid)
+	block_ids.sort()
+	for bid in block_ids:
+		var d: Dictionary = _block_data[bid]
+		blocks.append({
+			"label": str(d.get("label", "")),
+			"content": str(d.get("content", "")).replace("[lb]", "["),
+		})
+	var entry: Dictionary = {
+		"role": role,
+		"text": "",
+		"blocks": blocks,
+	}
+	return _v96_extract_ai_text_from_entry(entry)
+
+func _v96_extract_tool_name(label: String) -> String:
+	var s: String = label.strip_edges()
+	var re := RegEx.new()
+	re.compile("^\\[\\d+/\\d+\\]\\s*")
+	s = re.sub(s, "", true)
+	s = s.replace("🛠", "").replace("🔧", "").strip_edges()
+	var sp: PackedStringArray = s.split(" ", false)
+	if sp.size() > 0:
+		return str(sp[0])
+	return s
+
+func _v98_clean_summary(s: String) -> String:
+	if s.strip_edges() == "":
+		return s
+	var t: String = s
+	var re := RegEx.new()
+	re.compile("<tool_call>[\\s\\S]*?</tool_call>")
+	t = re.sub(t, "", true)
+	re.compile("<tool_result>[\\s\\S]*?</tool_result>")
+	t = re.sub(t, "", true)
+	re.compile("<thinking>[\\s\\S]*?</thinking>")
+	t = re.sub(t, "", true)
+	re.compile("\\[工具调用\\][^\\n]*")
+	t = re.sub(t, "", true)
+	re.compile("\\[工具结果\\][^\\n]*")
+	t = re.sub(t, "", true)
+	return t.strip_edges()
+
+func _v102_strip_md_links(value):
+	if value is String:
+		return _v102_strip_md_link_str(value)
+	elif value is Dictionary:
+		var out: Dictionary = {}
+		for k in value.keys():
+			out[k] = _v102_strip_md_links(value[k])
+		return out
+	elif value is Array:
+		var out2: Array = []
+		for item in value:
+			out2.append(_v102_strip_md_links(item))
+		return out2
+	return value
+
+
+func _v102_strip_md_link_str(s: String) -> String:
+	var t: String = s
+	var guard: int = 0
+	while guard < 50:
+		guard += 1
+		var lb: int = t.find("[")
+		if lb < 0:
+			break
+		var rb: int = t.find("]", lb + 1)
+		if rb < 0:
+			break
+		if rb + 1 >= t.length() or t[rb + 1] != "(":
+			break
+		var lp: int = t.find(")", rb + 2)
+		if lp < 0:
+			break
+		var inner_text: String = t.substr(lb + 1, rb - lb - 1)
+		t = t.substr(0, lb) + inner_text + t.substr(lp + 1)
+	return t
 

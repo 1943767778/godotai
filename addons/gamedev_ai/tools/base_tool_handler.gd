@@ -44,3 +44,18 @@ func _is_composite() -> bool:
 
 func _has_undo() -> bool:
 	return _get_undo_redo() != null
+
+
+func _list_node_paths(root: Node, max_depth: int = 3) -> Array:
+	var result: Array = []
+	var stack: Array = [[root, 0]]
+	while not stack.is_empty():
+		var item = stack.pop_back()
+		var n: Node = item[0]
+		var d: int = item[1]
+		if d > 0:
+			result.append(str(root.get_path_to(n)))
+		if d < max_depth:
+			for c in n.get_children():
+				stack.append([c, d + 1])
+	return result
