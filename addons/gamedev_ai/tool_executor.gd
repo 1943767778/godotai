@@ -200,7 +200,7 @@ func _create_file_undoable(path: String, content: String):
 		DirAccess.make_dir_recursive_absolute(dir_path)
 
 	# Special handling for project.godot: use ProjectSettings API to avoid "reload from disk" popup
-	if path == "res://project.godot":
+	if path == "res://project.godot.orig":
 		_apply_project_settings_from_content(content)
 		return
 

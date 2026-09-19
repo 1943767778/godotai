@@ -19,7 +19,7 @@ func get_engine_version_context() -> String:
 	ctx += "Major: " + str(info.major) + " | Minor: " + str(info.minor) + " | Patch: " + str(info.patch) + "\n"
 	
 	# Read project.godot header to detect config_version and compatibility fields
-	var project_file = FileAccess.open("res://project.godot", FileAccess.READ)
+	var project_file = FileAccess.open("res://project.godot.orig", FileAccess.READ)
 	if project_file:
 		var header_lines: Array = []
 		var line_count = 0

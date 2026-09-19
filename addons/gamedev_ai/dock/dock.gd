@@ -1,6 +1,10 @@
 @tool
 extends VBoxContainer
 
+var _v61_summary_http: HTTPRequest = null
+var _v61_is_generating_summary: bool = false
+var _v61_retry_display_count: int = 0
+
 var gemini_client
 var context_manager
 var _tool_executor
@@ -133,6 +137,36 @@ var _is_retrying: bool = false
 var _last_send_payload: Dictionary = {}
 const _MAX_RETRIES: int = 5
 const _RETRY_DELAY_STEP: float = 3.0
+
+var _v83_auto_by_count: bool = false
+var _v83_auto_by_token: bool = false
+var _v83_auto_count_threshold: int = 20
+var _v83_auto_token_threshold: int = 10000
+var _v83_queued_count: int = 0
+
+var _v76_retry_waiting: bool = false
+var _v76_queued_count: int = 0
+var _v77_error_handled: bool = false
+var _v77_active: bool = false
+var _v77_retry_count: int = 0
+var _v77_retry_mode: String = "infinite"
+var _v77_retry_timer: Timer = null
+const _V75_EXTRA_RULES: String = "
+
+## 重要规则（必须遵守）
+1. 【插件目录保护】除非用户明确要求修改本插件本身的功能或代码，否则禁止对 res://addons/ 目录下的任何文件进行创建、修改、删除、移动等操作。用户要求实现游戏功能、修复游戏 bug 时，永远不要触碰 addons 目录。
+2. 【GDScript 类型推断】禁止写 `var x := dict.get(key)` 这类从 Variant 值推断类型的写法——本项目把 INFERRED_DECLARATION 警告当错误。从 Dictionary / JSON / 无类型函数返回值取值时，必须显式声明类型，例如写 `var o: Dictionary = _objectives.get(type)`，而不是 `var o := _objectives.get(type)`。
+"
+
+const _V86_QUEUE_HINT: String = "
+
+## 编辑器加载中
+如果调用文件编辑工具时反复出现「正在排队中」或长时间无响应，说明 Godot 编辑器可能没有完全加载好（例如从后台切回、编辑器仍在转圈）。此时不要反复重试，应当提示用户检查编辑器状态（是否仍在加载、是否有弹窗阻塞），建议用户重新打开 Godot 项目，并保持 Godot 软件在前台。
+"
+
+var _v86_queue_hint_pending: bool = false
+var _v89_tool_start_time: float = 0.0
+var _v89_tool_pending: bool = false
 
 signal preset_changed(config)
 signal settings_updated()
@@ -408,6 +442,15 @@ func _ready():
 	# ===== 修复73 收尾 =====
 	call_deferred("_v73_init")
 	# ===== 修复73 结束 =====
+
+	# ===== 修复77 收尾 =====
+	call_deferred("_v77_ensure_timer")
+	# ===== 修复77 结束 =====
+
+	# ===== 修复83v2 收尾 =====
+	call_deferred("_v83_init")
+	call_deferred("_v84_force_min_width")
+	# ===== 修复83v2 结束 =====
 func setup(client, manager, executor):
 	context_manager = manager
 	_tool_executor = executor
@@ -687,12 +730,16 @@ func _load_conversation(path):
 	if path == null or str(path) == "":
 		_show_toast("[color=red]无效路径[/color]")
 		return
-	var data = _read_session_data(path)
+	var path_str: String = str(path)
+	if _session_file_id != "":
+		var expected: String = HISTORY_DIR + "/" + _session_file_id + ".json"
+		if expected == path_str:
+			$TabContainer.current_tab = 1
+			return
+	var data = _read_session_data(path_str)
 	if data.is_empty():
-		_show_toast("[color=red]读取失败：" + str(path) + "[/color]")
+		_show_toast("[color=red]读取失败：" + path_str + "[/color]")
 		return
-	
-	# 优先读 messages（新格式），其次 transcript（旧格式）
 	var msgs = data.get("messages", null)
 	var trans = data.get("transcript", null)
 	var use_trans: Array = []
@@ -700,19 +747,14 @@ func _load_conversation(path):
 		use_trans = msgs
 	elif trans is Array and not trans.is_empty():
 		use_trans = trans
-	
 	if gemini_client:
-		var hist = data.get("history", [])
-		if hist is Array and "history" in gemini_client:
-			gemini_client.set("history", hist)
 		if "transcript" in gemini_client:
 			gemini_client.set("transcript", use_trans)
 		var sid: String = str(data.get("session_id", ""))
 		if sid != "":
 			_session_file_id = sid
-	
-	_v66_rebuild_chat_from_transcript()
-	_show_toast("[color=gray]已加载：" + path.get_file() + "[/color]")
+	_rebuild_chat_from_transcript()
+	_show_toast("[color=gray]已加载：" + path_str.get_file() + "[/color]")
 	$TabContainer.current_tab = 1
 func _rename_conversation(session_id, new_name):
 	var clean_name = str(new_name).strip_edges()
@@ -1203,7 +1245,7 @@ func _generate_default_title(transcript, history) -> String:
 	if title == "":
 		title = "对话 " + Time.get_datetime_string_from_system(false, true)
 	return title
-func _show_toast(message: String, duration: float = 5.0):
+func _show_toast(message: String, duration: float = 3.0):
 	var toast = PanelContainer.new()
 	toast.top_level = true
 	toast.z_index = 100
@@ -1270,10 +1312,11 @@ func _show_toast(message: String, duration: float = 5.0):
 		tw_out.tween_property(toast, "global_position:x", -toast.size.x, 0.3) \
 			.set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_IN)
 		tw_out.tween_property(toast, "modulate:a", 0.0, 0.3)
-		await tw_out.finished
-		if is_instance_valid(toast):
-			toast.queue_free()
-	_active_toasts.erase(toast)
+		tw_out.chain().tween_callback(func():
+			if is_instance_valid(toast):
+				toast.queue_free()
+			_active_toasts.erase(toast)
+		)
 func _v54_render_msg(entry):
 	if not (entry is Dictionary):
 		return
@@ -1354,8 +1397,10 @@ func _v66_load_older_messages():
 	await get_tree().process_frame
 	chat_scroll.scroll_vertical = old_scroll + (chat_vbox.size.y - old_height)
 func _on_status_changed(is_requesting: bool):
-	# 无限重试活跃期间：忽略 false，保持"终止"
-	if _v69_retry_active:
+	if _v77_active or _v77_retry_count > 0:
+		_update_ui_state(true)
+		return
+	if _v69_retry_active or _v76_retry_waiting or _is_retrying:
 		_update_ui_state(true)
 		return
 	_update_ui_state(is_requesting)
@@ -1377,10 +1422,11 @@ func _on_send_pressed():
 	if _v61_is_generating_summary:
 		_v61_cancel_summary()
 		return
-	if gemini_client and gemini_client.is_requesting:
+	# 任何重试状态 → 中断
+	if _v77_active or _v69_retry_active or _v76_retry_waiting or _is_retrying:
 		_stop_ai()
 		return
-	if _is_retrying or _v53_is_in_retry_loop():
+	if gemini_client and gemini_client.is_requesting:
 		_stop_ai()
 		return
 	var text = input_field.text.strip_edges()
@@ -1455,13 +1501,14 @@ func _get_filtered_tools() -> Array:
 	return tools
 func _stop_ai():
 	_v73_user_cancelled = true
-	_v73_force_reset_all()
-	_v73_user_cancelled = true
+	_v77_stop_all()
+	_v73_user_cancelled = true   # stop_all 不会清这个
+	# 主动断请求
+	if gemini_client:
+		gemini_client.cancel_request()
 	batch_queue.clear()
 	batch_results.clear()
 	current_tool_context = {}
-	if gemini_client:
-		gemini_client.cancel_request()
 	if _diff_preview_panel and _diff_preview_panel.visible:
 		_diff_preview_panel.visible = false
 		chat_scroll.visible = true
@@ -1469,8 +1516,8 @@ func _stop_ai():
 			_tool_executor.cancel_pending_action()
 	_current_bubble = null
 	_current_role = ""
+	_update_ui_state(false)
 	_show_toast("[color=orange]已手动取消[/color]")
-	_v73_deferred_clear_cancel()
 func _on_input_gui_input(event: InputEvent):
 	if event is InputEventKey and event.pressed:
 		if event.keycode == KEY_ENTER and event.shift_pressed:
@@ -1762,6 +1809,19 @@ func _is_game_running() -> bool:
 	return EditorInterface.is_playing_scene()
 
 func _process_send(prompt_text: String, is_execute_plan: bool = false, is_watch_mode: bool = false):
+	# ★ 强制重置所有重试状态（防止卡死）
+	_v77_error_handled = false
+	_v77_active = false
+	_v77_retry_count = 0
+	_v73_user_cancelled = false
+	_v69_retry_active = false
+	_v76_retry_waiting = false
+	_is_retrying = false
+	_retry_count = 0
+	_is_stopped = false
+	_last_send_payload = {}
+	if _v77_retry_timer != null and is_instance_valid(_v77_retry_timer):
+		_v77_retry_timer.stop()
 	if _is_game_running() and not is_watch_mode:
 		_add_to_chat("
 [color=orange][b]" + locale_manager.tr("game_running_warning") + "[/color]
@@ -1769,8 +1829,6 @@ func _process_send(prompt_text: String, is_execute_plan: bool = false, is_watch_
 		return
 	_is_stopped = false
 	_watch_fix_count = 0
-	
-	# 1. UI 层显示原文（不含摘要）
 	if not is_execute_plan:
 		if _show_time_enabled:
 			var _time_str: String = Time.get_datetime_string_from_system()
@@ -1783,11 +1841,9 @@ func _process_send(prompt_text: String, is_execute_plan: bool = false, is_watch_
 		_add_to_chat("
 [color=cyan][b]" + locale_manager.tr("executing_plan") + "[/b][/color]
 ")
-	
 	var selection = {}
 	if context_manager:
 		selection = context_manager.get_selection_info()
-	
 	var final_prompt = prompt_text
 	if not selection.is_empty() and not is_execute_plan:
 		final_prompt = "Selection Context (File: " + selection.path + "):
@@ -1798,7 +1854,6 @@ func _process_send(prompt_text: String, is_execute_plan: bool = false, is_watch_
 Command: " + prompt_text
 		_add_to_chat("[i]Using selection from " + selection.path.get_file() + "...[/i]
 ")
-
 	if plan_first_enabled and not is_execute_plan:
 		final_prompt += "
 
@@ -1807,7 +1862,6 @@ CRITICAL INSTRUCTION: The user has enabled 'Plan First' mode. Do NOT output any 
 	else:
 		_plan_pending = false
 		execute_plan_btn.visible = false
-
 	var context = ""
 	if context_enabled and context_manager:
 		context += "Engine Info:
@@ -1825,14 +1879,12 @@ CRITICAL INSTRUCTION: The user has enabled 'Plan First' mode. Do NOT output any 
 		context += "Current Script content:
 " + context_manager.get_current_script() + "
 "
-	
 	if _memory_manager:
 		var memory_text = _memory_manager.get_all_memories_formatted()
 		if memory_text != "":
 			context += "
 " + memory_text + "
 "
-	
 	if not _dropped_files.is_empty():
 		context += "
 --- Additional File Context ---
@@ -1846,7 +1898,6 @@ CRITICAL INSTRUCTION: The user has enabled 'Plan First' mode. Do NOT output any 
 					context += f.get_as_text() + "
 
 "
-	
 	var files_data = []
 	if not _attached_files.is_empty():
 		for file in _attached_files:
@@ -1868,20 +1919,26 @@ CRITICAL INSTRUCTION: The user has enabled 'Plan First' mode. Do NOT output any 
 		_show_toast("[i]" + locale_manager.tr("sending_attachments") + "[/i]")
 		_attached_files.clear()
 		_refresh_thumbnails()
-	
 	if screenshot_enabled and context_manager:
 		var scr = context_manager.get_editor_screenshot()
 		if not scr.is_empty():
 			files_data.append(scr)
 			_show_toast("[i]" + locale_manager.tr("capturing_screenshot") + "[/i]")
-
 	var tools = _get_filtered_tools()
-	
 	if gemini_client:
-		# ─── 2. 若有摘要 → 拼到 final_prompt 前缀 ───
 		var _sum: String = ""
 		if has_method("_v61_get_summary_text"):
 			_sum = _v61_get_summary_text()
+		# ─── history：有总结用摘要模式，无总结从 UI 重建 ───
+		if _sum.strip_edges() != "":
+			if has_method("_v61_apply_summary_history"):
+				_v61_apply_summary_history()
+			if has_method("_v69_force_summary_into_history"):
+				_v69_force_summary_into_history()
+		else:
+			if has_method("_v75_rebuild_history_from_ui"):
+				_v83_rebuild_history_from_transcript()
+		# ─── final_prompt：有总结时拼到前缀 ───
 		if _sum.strip_edges() != "":
 			final_prompt = "【对话摘要（历史上下文，仅供参考，无需回应本段）】
 " + \
@@ -1892,18 +1949,24 @@ CRITICAL INSTRUCTION: The user has enabled 'Plan First' mode. Do NOT output any 
 " + \
 				"【当前请求】
 " + final_prompt
-		
 		_last_send_payload = {
 			"final_prompt": final_prompt,
 			"context": context,
 		}
 		_retry_count = 0
-		# 重建 history（只保留摘要之后的消息）
-		if _sum.strip_edges() != "":
-			if has_method("_v61_apply_summary_history"):
-				_v61_apply_summary_history()
+		_v77_error_handled = false
+		_v77_active = false
+		_v77_retry_count = 0
+		# ─── 注入 addons / 编辑器规则 ───
+		var _v75_orig: String = str(gemini_client.custom_instructions)
+		var _v86_extra: String = _V75_EXTRA_RULES
+		if _v86_queue_hint_pending:
+			_v86_extra += _V86_QUEUE_HINT
+			_v86_queue_hint_pending = false
+		gemini_client.custom_instructions = _v75_orig + _v86_extra
 		gemini_client.send_prompt(final_prompt, context, tools, files_data)
-		_set_tool_progress("💭 接收响应中…")
+		gemini_client.custom_instructions = _v75_orig
+		_set_tool_progress("📨 消息已发出，正在接收消息…")
 		_on_clear_dropped_files()
 func _encode_image(image: Image) -> Dictionary:
 	var max_dim = 1024
@@ -1918,57 +1981,6 @@ func _encode_image(image: Image) -> Dictionary:
 		"data": base64
 	}
 
-func _on_poll_timer_timeout():
-	# 强制隐藏"当前选择"（防止任何路径复活）
-	if selection_status != null and is_instance_valid(selection_status):
-		selection_status.visible = false
-	if watch_mode_enabled:
-		_check_for_new_errors()
-func _check_for_new_errors():
-	var path = "user://logs/godot.log"
-	if not FileAccess.file_exists(path): return
-	
-	var file = FileAccess.open(path, FileAccess.READ)
-	if not file:
-		return
-	var length = file.get_length()
-	file.close()
-	
-	if _last_log_size == 0:
-		_last_log_size = length # Initial sync, don't trigger on old errors
-		return
-		
-	if length > _last_log_size:
-		pass
-		# Log has grown, read new content
-		file = FileAccess.open(path, FileAccess.READ)
-		file.seek(_last_log_size)
-		var new_content = file.get_buffer(length - _last_log_size).get_string_from_utf8()
-		file.close()
-		_last_log_size = length
-		
-		# Check for errors in new content
-		if "ERROR:" in new_content or "SCRIPT ERROR:" in new_content:
-			if gemini_client and not gemini_client.is_requesting:
-				pass
-				# Rate limiting: max fixes and cooldown
-				if _watch_fix_count >= _WATCH_MAX_FIXES:
-					_add_to_chat("\n[color=orange][b]" + locale_manager.tr("watch_max_limit").replace("{max}", str(_WATCH_MAX_FIXES)) + "[/b][/color]\n")
-					return
-				
-				var now = Time.get_unix_time_from_system()
-				if now < _watch_cooldown_until:
-					return  # Still in cooldown
-				
-				_watch_fix_count += 1
-				_watch_cooldown_until = now + _WATCH_COOLDOWN_SECS
-				_add_to_chat("\n[color=orange][b]" + locale_manager.tr("watch_error_detected").replace("{current}", str(_watch_fix_count)).replace("{max}", str(_WATCH_MAX_FIXES)) + "[/b][/color]\n")
-				
-				if _is_game_running():
-					EditorInterface.stop_playing_scene()
-				
-				_process_send("I noticed a new error in the console:\n" + new_content + "\n\nPlease analyze and fix it.", false, true)
-
 func _on_tool_calls(tool_calls: Array):
 	if _is_stopped:
 		return
@@ -1978,11 +1990,33 @@ func _on_tool_calls(tool_calls: Array):
 	batch_results.clear()
 	_batch_total = tool_calls.size()
 	
-	# 为每个 call 补上 8 位 id
+	# 清洗：丢弃 name 为空的 call；args 非 Dictionary 时补成 {}；补 8 位 id
+	var _v87_valid_calls: Array = []
+	var _v87_dropped: int = 0
 	for i in range(batch_queue.size()):
 		var c = batch_queue[i]
+		if not (c is Dictionary):
+			_v87_dropped += 1
+			continue
+		if str(c.get("name", "")) == "":
+			push_warning("GamedevAI: 丢弃 name 为空的工具调用")
+			_v87_dropped += 1
+			continue
+		var _v87_av = c.get("args", {})
+		if not (_v87_av is Dictionary):
+			c["args"] = {}
 		if not c.has("id") or str(c["id"]) == "":
 			c["id"] = _v34_gen_code()
+		_v87_valid_calls.append(c)
+	batch_queue = _v87_valid_calls
+	if batch_queue.is_empty():
+		_clear_tool_progress()
+		_update_ui_state(false)
+		if _v87_dropped > 0:
+			_show_toast("[color=orange]工具调用参数损坏，已忽略 " + str(_v87_dropped) + " 项[/color]")
+		return
+	if _v87_dropped > 0:
+		_show_toast("[color=orange]已忽略 " + str(_v87_dropped) + " 项损坏的工具调用[/color]")
 	
 	if not batch_queue.is_empty():
 		var first_tool = batch_queue[0]
@@ -2000,10 +2034,20 @@ func _process_next_batch_item():
 	
 	var call_data = batch_queue.pop_front()
 	current_tool_context = call_data
-	
-	var tool_name: String = call_data["name"]
-	var args: Dictionary = call_data["args"]
+	var tool_name: String = str(call_data.get("name", ""))
+	var _v87_args_v = call_data.get("args", {})
+	var args: Dictionary = _v87_args_v if _v87_args_v is Dictionary else {}
 	var tool_id: String = str(call_data.get("id", ""))
+	
+	if tool_name == "":
+		push_warning("GamedevAI: 跳过 name 为空的工具调用")
+		current_tool_context = {}
+		if not batch_queue.is_empty():
+			call_deferred("_process_next_batch_item")
+		else:
+			_clear_tool_progress()
+			_update_ui_state(false)
+		return
 	
 	if tool_name == "undo_tool_call":
 		var result: String = _v34_handle_undo(args) if has_method("_v34_handle_undo") else "UnDo 未启用"
@@ -2013,24 +2057,40 @@ func _process_next_batch_item():
 	var step: int = _batch_total - batch_queue.size()
 	var progress: String = "[" + str(step) + "/" + str(_batch_total) + "] " if _batch_total > 1 else ""
 	
-	# 工具调用标题 + 参数 合并为一个折叠块（标题=工具名，内容=参数）
+	# ─── 先备份（拿撤销码）───
+	var undo_code: String = ""
+	if has_method("_v34_backup_before_tool"):
+		undo_code = _v34_backup_before_tool(tool_name, args, tool_id)
+	
+	# ─── 构造块内容（参数 + 撤销码合并在一起）───
 	var arg_str: String = str(args)
+	var block_content: String = arg_str
+	if undo_code != "":
+		block_content += "
+
+🔐 已备份（撤销码: " + undo_code + "）"
+	
 	var block_label: String = progress + "🛠️ " + tool_name
-	_append_collapsible_block(block_label, arg_str, "dodgerblue", false)
+	_append_collapsible_block(block_label, block_content, "dodgerblue", false)
 	
 	_set_tool_progress(progress + "执行 " + tool_name)
-	
-	var undo_code: String = _v34_backup_before_tool(tool_name, args, tool_id) if has_method("_v34_backup_before_tool") else ""
-	if undo_code != "":
-		_add_to_chat("[color=#888888][i]🔐 已备份，撤销码: " + undo_code + "[/i][/color]
-", "ai")
-	
+	_v89_tool_start_time = Time.get_ticks_msec() / 1000.0
+	_v89_tool_pending = true
 	_tool_executor.execute_tool(tool_name, args)
 func _on_tool_output(output: String):
 	if _is_stopped:
 		_clear_tool_progress()
 		return
-		
+	
+	# 排队中检测
+	var low: String = output.to_lower()
+	if "排队" in output or "queued" in low or "waiting in queue" in low:
+		_v76_queued_count += 1
+		if _v76_queued_count >= 3:
+			_show_toast("[color=orange]工具多次排队中，编辑器可能仍在加载
+请检查 Godot 是否已完成启动，或尝试重新打开项目[/color]")
+			_v76_queued_count = 0
+	
 	var line_count = output.count("
 ") + 1
 	var tool_name: String = ""
@@ -2051,7 +2111,6 @@ func _on_tool_output(output: String):
 	else:
 		if gemini_client and not batch_results.is_empty():
 			var tools = _get_filtered_tools()
-				
 			var files_data = []
 			if not _attached_files.is_empty():
 				for file in _attached_files:
@@ -2064,11 +2123,9 @@ func _on_tool_output(output: String):
 						})
 				_attached_files.clear()
 				_refresh_thumbnails()
-				
 			gemini_client.send_tool_responses(batch_results, tools, files_data)
 			batch_results.clear()
-			_set_tool_progress("💭 思考中...")
-			
+			_set_tool_progress("📨 消息已发出，正在接收消息…")
 		if _tool_executor.has_method("commit_composite_action"):
 			_tool_executor.commit_composite_action()
 func _on_undo_pressed():
@@ -2138,13 +2195,13 @@ func _get_error_logs() -> String:
 	return "\n\n".join(filtered_errors)
 
 func _on_ai_response(response: String):
-	# 用户已取消 → 丢弃响应
+	pass
 	if _v73_user_cancelled:
 		_v73_user_cancelled = false
-		_v73_force_reset_all()
+		_v77_stop_all()
 		return
-	# 收到响应 → 强制清所有重试状态
-	_v73_force_reset_all()
+	_v77_stop_all()
+	_v77_retry_count = 0
 	if _is_stopped:
 		return
 	_try_display_reasoning()
@@ -2159,9 +2216,10 @@ func _on_ai_response(response: String):
 	_current_role = ""
 	if _plan_pending:
 		execute_plan_btn.visible = true
-	# 自动保存（AI 回复完毕）
 	if has_method("_v73_autosave"):
 		_v73_autosave()
+	if has_method("_v83_check_auto_summary"):
+		_v83_check_auto_summary()
 func _extract_text_tool_calls(text: String) -> Array:
 	var calls = []
 	
@@ -2211,31 +2269,34 @@ func _strip_tool_call_text(text: String) -> String:
 	return result
 
 func _on_ai_error(error: String):
-	if _v73_user_cancelled:
-		_v73_user_cancelled = false
-		_v73_force_reset_all()
+	pass
+	if error != "":
+		pass
+	# 同一次错误的重复信号 → 忽略
+	if _v77_error_handled:
 		return
-	if _is_stopped:
-		_v73_force_reset_all()
+	_v77_error_handled = true
+	
+	if _v73_user_cancelled or _is_stopped:
+		_v77_stop_all()
 		return
+	
 	# ─── 无限重试 ───
 	if _infinite_retry:
-		if _v69_retry_active:
-			return
 		if _last_send_payload.is_empty():
-			_v73_force_reset_all()
+			_v77_stop_all()
 			return
-		_v69_retry_count += 1
-		var wait_s: float = 5.0 if _v69_retry_count <= 3 else 7.5
-		_set_tool_progress("💭 接收响应中…（第 " + str(_v69_retry_count) + " 次，等待 " + str(int(wait_s)) + "s）")
-		_v69_ensure_timer()
-		_v69_retry_active = true
-		_v69_retry_cancelled = false
-		_v69_retry_timer.stop()
-		_v69_retry_timer.wait_time = wait_s
-		_v69_retry_timer.start()
+		_v77_active = true
+		_v77_retry_count += 1
+		var wait_s: float = 5.0
+		_set_tool_progress("💭 接收响应中…（第 " + str(_v77_retry_count) + " 次，等待 " + str(int(wait_s)) + "s）")
 		_update_ui_state(true)
+		_v77_ensure_timer()
+		_v77_retry_timer.stop()
+		_v77_retry_timer.wait_time = wait_s
+		_v77_retry_timer.start()
 		return
+	
 	# ─── 普通 5 次重试 ───
 	if _retry_count < _MAX_RETRIES and not _last_send_payload.is_empty():
 		_retry_count += 1
@@ -2244,20 +2305,14 @@ func _on_ai_error(error: String):
 		_show_toast("[color=yellow]将在 " + str(int(delay)) + " 秒后重试 (" + str(_retry_count) + "/" + str(_MAX_RETRIES) + ")…[/color]")
 		_set_tool_progress("⏳ " + str(int(delay)) + " 秒后重试 (" + str(_retry_count) + "/" + str(_MAX_RETRIES) + ")")
 		_update_ui_state(true)
-		await get_tree().create_timer(delay).timeout
-		if _v73_user_cancelled or _is_stopped:
-			_v73_force_reset_all()
-			return
-		if gemini_client and not _last_send_payload.is_empty():
-			_update_ui_state(true)
-			var tools = _get_filtered_tools()
-			gemini_client.send_prompt(_last_send_payload["final_prompt"], _last_send_payload["context"], tools, [])
-			_set_tool_progress("💭 接收响应中…（第 " + str(_retry_count) + " 次重试）")
-		else:
-			_v73_force_reset_all()
+		_v77_ensure_timer()
+		_v77_retry_timer.stop()
+		_v77_retry_timer.wait_time = delay
+		_v77_retry_mode = "normal"
+		_v77_retry_timer.start()
 	else:
 		_show_toast("[color=red]Error: " + error + "[/color]")
-		_v73_force_reset_all()
+		_v77_stop_all()
 func _log_user_message(msg: String, token_count: int = -1, insert_index: int = -1):
 	_add_to_chat(msg + "
 ", "user", insert_index)
@@ -2603,33 +2658,30 @@ func _toggle_block(id: int):
 		data.bubble_ref.set_meta("raw_bbcode", fixed_bb)
 		data.bubble_ref.text = fixed_bb
 func _add_to_chat(bbcode: String, role: String = "ai", insert_index: int = -1):
-	pass
-	# system 归一到 ai（同一种视觉，合并到同一气泡）
 	if role == "system":
 		role = "ai"
-	
-	# error 强制断开当前气泡 → 下一次创建新气泡
 	if role == "error":
 		_current_bubble = null
 		_current_role = ""
-	
 	_chat_log_bbcode += bbcode
-	
 	if _current_bubble == null or _current_role != role:
 		_create_chat_bubble(role, insert_index)
-		
 	_current_bubble.append_text(bbcode)
-	
 	var current_bb = _current_bubble.get_meta("raw_bbcode", "")
 	_current_bubble.set_meta("raw_bbcode", current_bb + bbcode)
-	
 	if insert_index == -1:
+		# 等 3 帧让 layout 稳定
 		await get_tree().process_frame
+		await get_tree().process_frame
+		await get_tree().process_frame
+		if chat_scroll == null or not is_instance_valid(chat_scroll):
+			return
 		var v_scroll = chat_scroll.get_v_scroll_bar()
-		if v_scroll:
-			var near_bottom: bool = (v_scroll.max_value - v_scroll.value - v_scroll.page) < 100
-			if near_bottom:
-				v_scroll.value = v_scroll.max_value
+		if v_scroll == null:
+			return
+		var near_bottom: bool = (v_scroll.max_value - v_scroll.value - v_scroll.page) < 150.0
+		if near_bottom:
+			v_scroll.value = v_scroll.max_value
 func _create_chat_bubble(role: String, insert_index: int = -1):
 	_current_role = role
 	var wrapper = VBoxContainer.new()
@@ -7910,7 +7962,7 @@ func _v36_set_tab_widths():
 	var tc = $TabContainer
 	if tc == null:
 		return
-	var target_w: float = 200.0 * 0.8
+	var target_w: float = 160.0
 	tc.custom_minimum_size = Vector2(target_w, 0)
 	if tc is Control:
 		tc.clip_contents = true
@@ -7919,6 +7971,55 @@ func _v36_set_tab_widths():
 			child.custom_minimum_size = Vector2(target_w, 0)
 			child.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 			child.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	var settings_tab = tc.get_node_or_null("Settings")
+	if settings_tab != null:
+		_v84_compress_recursive(settings_tab)
+
+
+func _v84_compress_recursive(node: Node):
+	if node is CheckBox:
+		node.custom_minimum_size = Vector2(0, 0)
+		node.size_flags_horizontal = Control.SIZE_FILL
+		node.clip_text = true
+		node.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	elif node is Label:
+		node.custom_minimum_size = Vector2(0, node.custom_minimum_size.y)
+		node.clip_text = true
+		node.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	elif node is OptionButton:
+		node.custom_minimum_size = Vector2(40, node.custom_minimum_size.y)
+		node.clip_text = true
+		node.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+		node.fit_to_longest_item = false
+	elif node is SpinBox:
+		node.custom_minimum_size = Vector2(50, node.custom_minimum_size.y)
+	elif node is Button:
+		if str(node.text).strip_edges() != "":
+			node.custom_minimum_size = Vector2(0, node.custom_minimum_size.y)
+			node.clip_text = true
+			node.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	elif node is LineEdit or node is TextEdit:
+		node.custom_minimum_size = Vector2(0, node.custom_minimum_size.y)
+	for c in node.get_children():
+		_v84_compress_recursive(c)
+
+
+func _v84_force_min_width():
+	await get_tree().process_frame
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var tc = $TabContainer
+	if tc == null:
+		return
+	var target_w: float = 160.0
+	for child in tc.get_children():
+		if child is Control:
+			child.custom_minimum_size = Vector2(target_w, 0)
+			child.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			child.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	var settings_tab = tc.get_node_or_null("Settings")
+	if settings_tab != null:
+		_v84_compress_recursive(settings_tab)
 
 
 func _v36_init():
@@ -8559,7 +8660,7 @@ func _v53_on_retry_timeout():
 		_update_ui_state(true)
 		var tools = _get_filtered_tools()
 		gemini_client.send_prompt(_last_send_payload["final_prompt"], _last_send_payload["context"], tools, [])
-		_set_tool_progress("💭 接收响应中…")
+		_set_tool_progress("📨 消息已发出，正在接收消息…")
 	else:
 		_v53_stop_all_retries()
 
@@ -9014,17 +9115,20 @@ func _v58_on_retry_timeout():
 
 func _v58_get_next_api_key(preset: Dictionary) -> String:
 	var keys: Array = preset.get("api_keys", [])
-	var idx: int = int(preset.get("api_key_index", 0))
-	if keys.is_empty():
+	# 剔除空
+	var clean: Array = []
+	for k in keys:
+		var s: String = str(k).strip_edges()
+		if s != "":
+			clean.append(s)
+	if clean.is_empty():
 		return str(preset.get("api_key", ""))
-	if idx < 0 or idx >= keys.size():
+	var idx: int = int(preset.get("api_key_index", 0))
+	if idx < 0 or idx >= clean.size():
 		idx = 0
-	var key: String = str(keys[idx])
-	idx = (idx + 1) % keys.size()
-	preset["api_key_index"] = idx
+	var key: String = str(clean[idx])
+	preset["api_key_index"] = (idx + 1) % clean.size()
 	return key
-
-
 func _v58_add_key_row(parent: VBoxContainer, initial_value: String, removable: bool):
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 4)
@@ -9206,47 +9310,43 @@ func _v61_load_keys_to_ui(keys: Array):
 		if is_instance_valid(row):
 			row.queue_free()
 	_v61_key_rows.clear()
+	# 剔除空
+	var clean: Array = []
+	for k in keys:
+		var s: String = str(k).strip_edges()
+		if s != "":
+			clean.append(s)
 	if api_input != null:
-		api_input.text = str(keys[0]) if keys.size() > 0 else ""
-	for i in range(1, keys.size()):
-		_v61_add_key_row(str(keys[i]))
-
-
+		api_input.text = str(clean[0]) if clean.size() > 0 else ""
+	for i in range(1, clean.size()):
+		_v61_add_key_row(str(clean[i]))
 func _v61_on_preset_selected_hook(index: int):
 	var config: Dictionary = presets.get(active_preset_name, {})
 	var keys: Array = config.get("api_keys", [])
 	if keys.is_empty():
-		var single: String = str(config.get("api_key", ""))
-		keys = [single] if single != "" else [""]
+		var single: String = str(config.get("api_key", "")).strip_edges()
+		if single != "":
+			keys = [single]
 	_v61_load_keys_to_ui(keys)
-
-
 func _v61_on_config_save_hook():
 	if active_preset_name == "" or not presets.has(active_preset_name):
 		return
-	var keys: Array = _v61_collect_all_keys()
-	presets[active_preset_name]["api_keys"] = keys
-	if keys.size() > 0:
-		presets[active_preset_name]["api_key"] = keys[0]
-
-
-# ═══════════════════════════════════════════════════════════════
-# 总结 history（按 provider 生成不同格式）
-# ═══════════════════════════════════════════════════════════════
-
-
-
-# ═══════════════════════════════════════════════════════════════
-# 修复64：总结（系统提示词）+ 文件命名 + 加载 + 进度
-# ═══════════════════════════════════════════════════════════════
-
-var _v61_summary_http: HTTPRequest = null
-var _v61_is_generating_summary: bool = false
-var _v61_retry_display_count: int = 0
-var _v64_summary_progress: String = ""
-
-
-# ─── 文件名：用"对话 {title}.json" ───
+	var raw: Array = _v61_collect_all_keys()
+	# 剔除空字符串 + 去重
+	var clean: Array = []
+	for k in raw:
+		var s: String = str(k).strip_edges()
+		if s != "" and not clean.has(s):
+			clean.append(s)
+	presets[active_preset_name]["api_keys"] = clean
+	if clean.size() > 0:
+		presets[active_preset_name]["api_key"] = clean[0]
+		# 重置索引（防止越界）
+		var idx: int = int(presets[active_preset_name].get("api_key_index", 0))
+		if idx >= clean.size() or idx < 0:
+			presets[active_preset_name]["api_key_index"] = 0
+	_save_presets()
+	pass
 func _v66_get_session_file_id() -> String:
 	if _session_file_id != "":
 		return _session_file_id
@@ -9449,19 +9549,31 @@ func _v61_apply_summary_history():
 
 
 func _v61_build_hist_entry(role: String, text: String, is_openai: bool) -> Dictionary:
+	# ─── OpenAI / OpenRouter / 本地兼容：system, user, assistant ───
+	# ─── Gemini：user, model ───
 	if is_openai:
-		var r2: String = role
-		if r2 == "model":
-			r2 = "assistant"
-		return {"role": r2, "content": text}
+		var r: String = "user"
+		match role:
+			"user": r = "user"
+			"ai", "model", "assistant", "system":
+				if role == "system":
+					r = "system"
+				else:
+					r = "assistant"
+			_: r = "assistant"   # 默认当 assistant，避免 400
+		return {"role": r, "content": text}
 	else:
-		var r3: String = role
-		if r3 == "assistant":
-			r3 = "model"
-		return {"role": r3, "parts": [{"text": text}]}
-
-
-# ─── 生成总结（进度 + 可取消）───
+		var r: String = "user"
+		match role:
+			"user": r = "user"
+			"ai", "model", "assistant":
+				r = "model"
+			"system":
+				# Gemini 不支持 system role 在 contents 里
+				# 把它当 user 文本前缀处理
+				return {"role": "user", "parts": [{"text": "[System] " + text}]}
+			_: r = "model"
+		return {"role": r, "parts": [{"text": text}]}
 func _v61_generate_summary(target_bubble):
 	if _v61_is_generating_summary:
 		_show_toast("[color=yellow]正在总结中，请勿重复点击[/color]")
@@ -9470,12 +9582,16 @@ func _v61_generate_summary(target_bubble):
 	for c in chat_vbox.get_children():
 		if c == target_bubble:
 			break
-		if c.has_meta("is_summary"):
-			continue
 		if not c.has_meta("role"):
 			continue
 		var role: String = str(c.get_meta("role"))
 		if role == "summary":
+			var st: String = str(c.get_meta("summary_text", ""))
+			if st.strip_edges() != "":
+				conversation += "【上一轮总结】
+" + st + "
+
+"
 			continue
 		var lbl = c.get_meta("label", null)
 		if not is_instance_valid(lbl):
@@ -9483,7 +9599,9 @@ func _v61_generate_summary(target_bubble):
 		var txt: String = lbl.get_parsed_text()
 		if txt.strip_edges() == "":
 			continue
-		conversation += ("用户：" if role == "user" else "AI：") + txt + "\n\n"
+		conversation += ("用户：" if role == "user" else "AI：") + txt + "
+
+"
 	if conversation.strip_edges() == "":
 		_show_toast("[color=yellow]没有可总结的内容[/color]")
 		return
@@ -9499,23 +9617,29 @@ func _v61_generate_summary(target_bubble):
 		api_key = str(preset.get("api_key", ""))
 	presets[active_preset_name] = preset
 	_save_presets()
-	var summary_prompt = "你是一个对话总结助手。请将以下对话总结为简明摘要，保留关键信息：\n- 用户的主要目标\n- 已完成事项\n- 重要决策\n- 待办事项\n只输出摘要内容，不要任何前缀说明。\n\n=== 对话内容 ===\n" + conversation
+	var summary_prompt = "你是一个对话总结助手。请将以下对话总结为简明摘要，保留关键信息：
+- 用户的主要目标
+- 已完成事项
+- 重要决策
+- 待办事项
+只输出摘要内容，不要任何前缀说明。
+
+=== 对话内容 ===
+" + conversation
 	_v61_is_generating_summary = true
-	_update_ui_state(true)   # 发送按钮变终止
+	_update_ui_state(true)
 	_set_tool_progress("💭 正在准备总结…")
-	
 	if _v61_summary_http == null:
 		_v61_summary_http = HTTPRequest.new()
 		_v61_summary_http.use_threads = true
 		_v61_summary_http.timeout = 360.0
 		add_child(_v61_summary_http)
 		_v61_summary_http.request_completed.connect(_v61_on_summary_response)
-	
 	var url := ""
 	var headers := ["Content-Type: application/json"]
 	var body := ""
 	if provider == 0:
-		var m: String = model if model != "" else "gemini-1.5-flash"
+		var m: String = model if model != "" else "gemini-2.0-flash"
 		if base_url != "":
 			url = base_url.rstrip("/") + "/v1beta/models/" + m + ":generateContent"
 		else:
@@ -9534,21 +9658,12 @@ func _v61_generate_summary(target_bubble):
 		if api_key != "":
 			headers.append("Authorization: Bearer " + api_key)
 		body = JSON.stringify({"model": m2, "messages": [{"role": "user", "content": summary_prompt}]})
-	
-	_set_tool_progress("💭 正在连接 API…")
-	await get_tree().create_timer(0.4).timeout
-	if not _v61_is_generating_summary:
-		return
-	_set_tool_progress("💭 等待 AI 输出总结…")
-	
 	var err = _v61_summary_http.request(url, headers, HTTPClient.METHOD_POST, body)
 	if err != OK:
 		_v61_is_generating_summary = false
 		_update_ui_state(false)
 		_clear_tool_progress()
 		_show_toast("[color=red]总结请求失败：" + str(err) + "[/color]")
-
-
 func _v61_on_summary_response(_result, code, _headers, body):
 	_v61_is_generating_summary = false
 	_update_ui_state(false)
@@ -9935,9 +10050,10 @@ func _v69_start_retry_wait(wait_s: float):
 
 # 计时器到时：所有状态检查通过才发请求；否则清理
 func _v69_on_retry_timeout():
+	# 状态检查（任一条不满足 → 终止重试）
 	if _v73_user_cancelled:
 		_v73_force_reset_all()
-		_v73_user_cancelled = true
+		_v73_user_cancelled = false
 		return
 	if _is_stopped:
 		_v73_force_reset_all()
@@ -9955,8 +10071,10 @@ func _v69_on_retry_timeout():
 		_v73_force_reset_all()
 		return
 	if input_field != null and input_field.editable == true:
+		# 输入框已恢复可编辑 → 用户已终止
 		_v73_force_reset_all()
 		return
+	# 发送
 	var tools = _get_filtered_tools()
 	gemini_client.send_prompt(_last_send_payload["final_prompt"], _last_send_payload["context"], tools, [])
 	_set_tool_progress("💭 接收响应中…（第 " + str(_v69_retry_count) + " 次已发出）")
@@ -10042,6 +10160,7 @@ func _v73_force_reset_all():
 	_v69_retry_active = false
 	_v69_retry_cancelled = false
 	_v69_retry_count = 0
+	_v76_retry_waiting = false
 	_is_retrying = false
 	_retry_count = 0
 	_is_stopped = false
@@ -10050,8 +10169,6 @@ func _v73_force_reset_all():
 		_v69_retry_timer.stop()
 	_clear_tool_progress()
 	_update_ui_state(false)
-
-
 func _v73_autosave():
 	if _v73_autosave_pending:
 		return
@@ -10080,3 +10197,228 @@ func _v73_deferred_clear_cancel():
 
 func _v73_init():
 	_v73_user_cancelled = false
+
+
+
+# ═══════════════════════════════════════════════════════════════
+# 修复75：无总结时重建 history + addons 规则
+# ═══════════════════════════════════════════════════════════════
+
+
+
+# ═══════════════════════════════════════════════════════════════
+# 修复75：无总结时重建 history + addons 规则
+# ═══════════════════════════════════════════════════════════════
+
+
+
+func _v77_ensure_timer():
+	if _v77_retry_timer != null and is_instance_valid(_v77_retry_timer):
+		return
+	_v77_retry_timer = Timer.new()
+	_v77_retry_timer.name = "V77RetryTimer"
+	_v77_retry_timer.one_shot = true
+	_v77_retry_timer.wait_time = 5.0
+	_v77_retry_timer.timeout.connect(_v77_on_timer_timeout)
+	add_child(_v77_retry_timer)
+
+
+func _v77_on_timer_timeout():
+	# 状态检查
+	if _v73_user_cancelled or _is_stopped:
+		_v77_stop_all()
+		return
+	if _v77_retry_mode == "infinite" and not _infinite_retry:
+		_v77_stop_all()
+		return
+	if _v77_retry_mode == "normal" and _retry_count >= _MAX_RETRIES:
+		_v77_stop_all()
+		return
+	if _last_send_payload.is_empty() or gemini_client == null:
+		_v77_stop_all()
+		return
+	# 发送
+	_update_ui_state(true)
+	var tools = _get_filtered_tools()
+	gemini_client.send_prompt(_last_send_payload["final_prompt"], _last_send_payload["context"], tools, [])
+	# 允许下次 error 被处理
+	_v77_error_handled = false
+	if _v77_retry_mode == "infinite":
+		_set_tool_progress("💭 接收响应中…（第 " + str(_v77_retry_count) + " 次已发出）")
+	else:
+		_set_tool_progress("💭 接收响应中…（第 " + str(_retry_count) + " 次重试）")
+
+
+func _v77_stop_all():
+	_v77_error_handled = false
+	_v77_active = false
+	_v77_retry_count = 0
+	_v77_retry_mode = "infinite"
+	if _v77_retry_timer != null and is_instance_valid(_v77_retry_timer):
+		_v77_retry_timer.stop()
+	# 清旧字段
+	_v69_retry_active = false
+	_v76_retry_waiting = false
+	_is_retrying = false
+	_retry_count = 0
+	_last_send_payload = {}
+	_clear_tool_progress()
+	_update_ui_state(false)
+
+
+func _v77_is_busy() -> bool:
+	return _v77_active or _v69_retry_active or _v76_retry_waiting or _is_retrying
+
+
+func _on_poll_timer_timeout():
+	if selection_status != null and is_instance_valid(selection_status):
+		selection_status.visible = false
+	if watch_mode_enabled:
+		_check_for_new_errors()
+
+
+func _check_for_new_errors():
+	var path = "user://logs/godot.log"
+	if not FileAccess.file_exists(path):
+		return
+	var file = FileAccess.open(path, FileAccess.READ)
+	if not file:
+		return
+	var length = file.get_length()
+	file.close()
+	if _last_log_size == 0:
+		_last_log_size = length
+		return
+	if length > _last_log_size:
+		file = FileAccess.open(path, FileAccess.READ)
+		file.seek(_last_log_size)
+		var new_content = file.get_buffer(length - _last_log_size).get_string_from_utf8()
+		file.close()
+		_last_log_size = length
+		if "ERROR:" in new_content or "SCRIPT ERROR:" in new_content:
+			if gemini_client and not gemini_client.is_requesting:
+				if _watch_fix_count >= _WATCH_MAX_FIXES:
+					return
+				var now = Time.get_unix_time_from_system()
+				if now < _watch_cooldown_until:
+					return
+				_watch_fix_count += 1
+				_watch_cooldown_until = now + _WATCH_COOLDOWN_SECS
+				if _is_game_running():
+					EditorInterface.stop_playing_scene()
+				_process_send("I noticed a new error:\n" + new_content, false, true)
+
+
+
+func _v81_dump_state(tag: String = ""):
+	var s: String = "[AI-状态"
+	if tag != "": s += "-" + tag
+	s += "] err_handled=" + str(_v77_error_handled) + " active=" + str(_v77_active) + " count=" + str(_v77_retry_count) + " retrying=" + str(_is_retrying) + " is_stopped=" + str(_is_stopped)
+	if gemini_client:
+		s += " requesting=" + str(gemini_client.is_requesting)
+	print(s)
+
+func _v83_load_auto_summary_settings():
+	var settings = EditorInterface.get_editor_settings()
+	if settings.has_setting("gamedev_ai/auto_summary_by_count"):
+		_v83_auto_by_count = settings.get_setting("gamedev_ai/auto_summary_by_count")
+	if settings.has_setting("gamedev_ai/auto_summary_by_token"):
+		_v83_auto_by_token = settings.get_setting("gamedev_ai/auto_summary_by_token")
+	if settings.has_setting("gamedev_ai/auto_summary_count_threshold"):
+		_v83_auto_count_threshold = settings.get_setting("gamedev_ai/auto_summary_count_threshold")
+	if settings.has_setting("gamedev_ai/auto_summary_token_threshold"):
+		_v83_auto_token_threshold = settings.get_setting("gamedev_ai/auto_summary_token_threshold")
+
+func _v83_save_auto_summary_settings():
+	var settings = EditorInterface.get_editor_settings()
+	settings.set_setting("gamedev_ai/auto_summary_by_count", _v83_auto_by_count)
+	settings.set_setting("gamedev_ai/auto_summary_by_token", _v83_auto_by_token)
+	settings.set_setting("gamedev_ai/auto_summary_count_threshold", _v83_auto_count_threshold)
+	settings.set_setting("gamedev_ai/auto_summary_token_threshold", _v83_auto_token_threshold)
+
+func _v83_on_count_toggled(v: bool):
+	_v83_auto_by_count = v
+	_v83_save_auto_summary_settings()
+	if v:
+		_v83_check_auto_summary()
+
+func _v83_on_token_toggled(v: bool):
+	_v83_auto_by_token = v
+	_v83_save_auto_summary_settings()
+	if v:
+		_v83_check_auto_summary()
+
+func _v83_on_count_spin(v: float):
+	_v83_auto_count_threshold = int(v)
+	_v83_save_auto_summary_settings()
+
+func _v83_on_token_spin(v: float):
+	_v83_auto_token_threshold = int(v)
+	_v83_save_auto_summary_settings()
+
+func _v83_check_auto_summary():
+	# 已禁用自动总结触发
+	return
+
+
+func _v83_setup_autosummary_ui():
+	# 已删除自动总结 UI
+	pass
+
+
+func _v83_rebuild_history_from_transcript():
+	if not gemini_client:
+		return
+	var trans = gemini_client.get("transcript")
+	if not (trans is Array):
+		return
+	var provider_index: int = 0
+	var preset = presets.get(active_preset_name, {})
+	if preset is Dictionary:
+		provider_index = int(preset.get("provider", 0))
+	var is_openai: bool = (provider_index != 0)
+	var last_summary_idx: int = -1
+	for i in range(trans.size() - 1, -1, -1):
+		var e = trans[i]
+		if e is Dictionary and str(e.get("role", "")) == "summary":
+			last_summary_idx = i
+			break
+	var new_hist: Array = []
+	var summary_text: String = ""
+	if last_summary_idx >= 0:
+		var se = trans[last_summary_idx]
+		if se is Dictionary:
+			summary_text = str(se.get("text", ""))
+		for i in range(last_summary_idx + 1, trans.size()):
+			var e = trans[i]
+			if not (e is Dictionary):
+				continue
+			var r = str(e.get("role", ""))
+			if r == "summary":
+				continue
+			var t = str(e.get("text", ""))
+			if t.strip_edges() == "":
+				continue
+			new_hist.append(_v61_build_hist_entry(r, t, is_openai))
+	else:
+		for e in trans:
+			if not (e is Dictionary):
+				continue
+			var r = str(e.get("role", ""))
+			if r == "summary":
+				continue
+			var t = str(e.get("text", ""))
+			if t.strip_edges() == "":
+				continue
+			new_hist.append(_v61_build_hist_entry(r, t, is_openai))
+	if summary_text != "":
+		var u = _v61_build_hist_entry("user", "[之前对话的摘要，供上下文参考]\n" + summary_text, is_openai)
+		var m = _v61_build_hist_entry("model", "收到，我已了解之前的对话背景。", is_openai)
+		new_hist.insert(0, m)
+		new_hist.insert(0, u)
+	gemini_client.set("history", new_hist)
+
+func _v83_init():
+	_v83_load_auto_summary_settings()
+	_v83_setup_autosummary_ui()
+
